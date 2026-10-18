@@ -1785,3 +1785,41 @@ class TestSpacedMediaPathSingleDelivery:
         assert names == ["build.log", "shot.png"], (
             f"expected both files, got {names}"
         )
+
+    def test_two_spellings_of_one_file_deliver_once(self, tmp_path, monkeypatch):
+        """The same file named two ways in one reply is one attachment.
+
+        The dedup key resolves an existing path, so two spellings of one file
+        collapse without any docker translation being involved: a redundant
+        path component (``/output/./shot.png``) or a symlink to the file. This
+        is the same class of duplicate as the spaced-path case - one file, two
+        strings - reached through the other branch of the key, and it is the
+        branch a Windows gateway exercises when on-disk validation normalizes
+        forward slashes to backslashes.
+
+        Distinct files must still both survive; that is asserted here too, so a
+        key that over-collapses cannot pass this test.
+        """
+        host = self._mount(monkeypatch, tmp_path)
+        shot = host / "shot.png"
+        shot.write_bytes(b"png")
+        other = host / "other.png"
+        other.write_bytes(b"png")
+
+        media, _ = BasePlatformAdapter.extract_media(
+            "MEDIA:/output/shot.png\nMEDIA:/output/./shot.png\n"
+        )
+        delivered = BasePlatformAdapter.filter_media_delivery_paths(
+            media, session_key="agent:main:matrix:dm:room"
+        )
+        assert len(delivered) == 1, (
+            f"two spellings of one file gave {len(delivered)} candidates: "
+            f"{[p for p, _ in delivered]}"
+        )
+
+        distinct, _ = BasePlatformAdapter.extract_media(
+            "MEDIA:/output/shot.png\nMEDIA:/output/other.png\n"
+        )
+        assert len(distinct) == 2, (
+            f"two distinct files collapsed into {[p for p, _ in distinct]}"
+        )
