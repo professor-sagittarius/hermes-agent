@@ -1710,7 +1710,9 @@ class TestSpacedMediaPathSingleDelivery:
     The duplicate is not a Windows-separator artefact: the two entries can be
     a container path and its docker-mount translation, which no amount of
     ``normcase``/``normpath`` collapses because they are different strings
-    naming the same file. These tests pin the platform-independent shape.
+    naming the same file. ``test_spaced_container_path_delivers_once`` pins that
+    shape on Linux; the second test is the guard against over-suppressing the
+    re-walk.
     """
 
     def _mount(self, monkeypatch, tmp_path):
@@ -1747,23 +1749,24 @@ class TestSpacedMediaPathSingleDelivery:
         )
         assert os.path.realpath(delivered[0][0]) == os.path.realpath(produced)
 
-    def test_extensionless_tag_before_known_extension_tag_survives(
+    def test_unknown_extension_tag_survives_alongside_known_extension_tag(
         self, tmp_path, monkeypatch
     ):
-        """An extension-less tag earlier in the reply must still deliver.
+        """Two tags in one reply, one with an unknown extension, both deliver.
 
-        This pins the counterexample to a span-overlap guard. When the
-        extension-less tag precedes a known-extension tag, the extension-less
-        match starts at offset 0 while the known-extension span begins at the
-        second tag - and with the tags on one line the space-tolerant path
-        class of ``MEDIA_TAG_CLEANUP_RE`` swallows both into a single span that
-        begins at offset 0, so "match starts inside a known span" is true for
-        the earlier tag too. A guard keyed on overlapping offsets therefore
-        drops a real attachment: silent loss is worse than the duplicate it
-        fixes.
+        The extension-less scanner re-walks tags the known-extension scanner
+        already took, and ``extract_media`` now keys its dedup on the resolved
+        path rather than the raw string. A future change that instead suppresses
+        the re-walk by match position would be wrong here: ``.log`` is not in
+        the known-extension alternation, so it is reached ONLY through the
+        extension-less scanner, and any positional suppression that swallows it
+        loses a real attachment. Silent loss is worse than the duplicate.
 
-        The newline-separated form is used because it is well formed: one tag
-        per line, which is how a reply presents two files.
+        The tags are newline-separated because that is the well-formed shape a
+        reply uses for two files. On one line ``MEDIA_TAG_CLEANUP_RE``'s
+        space-tolerant path class glues the tags into a single invalid path and
+        the known-extension tag is lost - a separate pre-existing defect, not
+        the one under test, so pinning it here would assert the wrong thing.
         """
         host = self._mount(monkeypatch, tmp_path)
         log = host / "build.log"
