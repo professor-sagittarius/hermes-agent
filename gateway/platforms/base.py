@@ -3297,15 +3297,16 @@ class BasePlatformAdapter(ABC):
         def _dedup_key(path: str) -> str:
             # A path that already exists on the host is keyed by its realpath, which collapses
             # the symlink and Windows-separator spellings. Only a path that does NOT exist can
-            # be a container path needing translation - and translation is attempted only then,
-            # because it logs a diagnostic on failure and a host path that resolves is not a
-            # failed translation worth reporting.
+            # be a container path needing translation.
             try:
                 if os.path.exists(path):
                     return os.path.realpath(path)
             except (OSError, RuntimeError, ValueError):
                 return path
-            resolved = _translate_docker_container_media_path(Path(path))
+            # quiet=True: this is an internal key computation, and the delivery layer reports
+            # the same unresolved container path itself, so translating loudly here would
+            # double every diagnostic for a path that is going to be skipped anyway.
+            resolved = _translate_docker_container_media_path(Path(path), quiet=True)
             if resolved is not None:
                 try:
                     return os.path.realpath(str(resolved))
