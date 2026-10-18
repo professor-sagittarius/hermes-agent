@@ -3279,14 +3279,45 @@ class BasePlatformAdapter(ABC):
         # - code blocks / inline code / blockquotes hold prose examples (#35695) - serialized JSON string
         #   values hold stored tool-result text (#34375) Both maskers are offset-preserving (chars ->
         #   spaces) so match offsets stay valid; chaining them masks the union of both protected regions.
-        # Dedupe on the expanded path (first occurrence wins) so the same file referenced twice in one
-        # response — e.g. a MEDIA tag inline AND in a summary footer — is uploaded once, not twice (#29131).
+        # Dedupe on the file a path NAMES, not on the string it is spelled with, so the same
+        # file referenced twice in one response — a MEDIA tag inline AND in a summary footer
+        # (#29131), or the literal tag path AND the path the extension-less scanner resolves it
+        # to — is uploaded once.
+        #
+        # The two spellings are not always two spellings of one existing file. A docker agent's
+        # tag names the CONTAINER path while validation returns the HOST path it translates to,
+        # and those are different strings naming one file; `realpath` cannot collapse them
+        # because the container path does not exist on the host (realpath is identity for a
+        # nonexistent path). So the key is the path as the DELIVERY layer sees it: the same
+        # translation `validate_media_delivery_path` applies, when it resolves, and the
+        # realpath'd string otherwise. That keeps the symlink and Windows-separator variants
+        # collapsing too, since realpath covers those.
         seen_paths: set = set()
+
+        def _dedup_key(path: str) -> str:
+            # A path that already exists on the host is keyed by its realpath, which collapses
+            # the symlink and Windows-separator spellings. Only a path that does NOT exist can
+            # be a container path needing translation - and translation is attempted only then,
+            # because it logs a diagnostic on failure and a host path that resolves is not a
+            # failed translation worth reporting.
+            try:
+                if os.path.exists(path):
+                    return os.path.realpath(path)
+            except (OSError, RuntimeError, ValueError):
+                return path
+            resolved = _translate_docker_container_media_path(Path(path))
+            if resolved is not None:
+                try:
+                    return os.path.realpath(str(resolved))
+                except (OSError, RuntimeError, ValueError):
+                    return str(resolved)
+            return path
 
         def _add(path: str) -> None:
             # is_voice only for audio: a voice-flagged image would leave the photo batch.
-            if path not in seen_paths:
-                seen_paths.add(path)
+            key = _dedup_key(path)
+            if key not in seen_paths:
+                seen_paths.add(key)
                 media.append((path, has_voice_tag and os.path.splitext(path)[1].lower() in _AUDIO_EXTS))
         for match in MEDIA_TAG_CLEANUP_RE.finditer(scan_content):
             path = _normalize_media_tag_path(match.group("path"))

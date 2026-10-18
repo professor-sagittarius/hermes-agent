@@ -1,5 +1,6 @@
 """Tests for gateway/platforms/base.py — MessageEvent, media extraction, message truncation."""
 
+import json
 import logging
 import os
 import time
@@ -1692,3 +1693,92 @@ class TestPlatformLockTakeoverGovernance:
         assert adapter._acquire_platform_lock("discord-token", "tok", "Discord") is False
         assert len(takeover_calls) == 1
         assert adapter._platform_lock_takeover_attempted is True
+
+
+class TestSpacedMediaPathSingleDelivery:
+    """A ``MEDIA:`` tag whose path contains a space must yield exactly one
+    delivery candidate, on every platform.
+
+    The extension-less scanner (``MEDIA_EXTENSIONLESS_TAG_RE`` +
+    ``_match_extensionless_path``) re-walks a tag the known-extension scanner
+    (``MEDIA_TAG_CLEANUP_RE``) has already taken. Its path class stops at the
+    first whitespace, so it captures only the leading token; validation then
+    extends that token across single spaces until the path resolves, and
+    returns the RESOLVED path. ``extract_media``'s ``seen_paths`` dedupes on
+    the raw string, so the original and the resolved spelling both survive.
+
+    The duplicate is not a Windows-separator artefact: the two entries can be
+    a container path and its docker-mount translation, which no amount of
+    ``normcase``/``normpath`` collapses because they are different strings
+    naming the same file. These tests pin the platform-independent shape.
+    """
+
+    def _mount(self, monkeypatch, tmp_path):
+        """Bind a docker mount so a container path translates to a host file."""
+        host = tmp_path / "media-export"
+        host.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{host}:/output"]))
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (str(tmp_path),)
+        )
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        return host
+
+    def test_spaced_container_path_delivers_once(self, tmp_path, monkeypatch):
+        """One spaced MEDIA tag under a docker mount is one attachment.
+
+        Fails on main: the extension-less walk resolves ``/output/No-Buy``
+        forward to the host path, which is a second, distinct string.
+        """
+        host = self._mount(monkeypatch, tmp_path)
+        produced = host / "No-Buy Year - Closet System.xlsx"
+        produced.write_bytes(b"xlsx")
+
+        media, _ = BasePlatformAdapter.extract_media(
+            "Updated file:\nMEDIA:/output/No-Buy Year - Closet System.xlsx\n"
+        )
+        delivered = BasePlatformAdapter.filter_media_delivery_paths(
+            media, session_key="agent:main:matrix:dm:room"
+        )
+
+        assert len(delivered) == 1, (
+            f"one tag produced {len(delivered)} candidates: {[p for p, _ in delivered]}"
+        )
+        assert os.path.realpath(delivered[0][0]) == os.path.realpath(produced)
+
+    def test_extensionless_tag_before_known_extension_tag_survives(
+        self, tmp_path, monkeypatch
+    ):
+        """An extension-less tag earlier in the reply must still deliver.
+
+        This pins the counterexample to a span-overlap guard. When the
+        extension-less tag precedes a known-extension tag, the extension-less
+        match starts at offset 0 while the known-extension span begins at the
+        second tag - and with the tags on one line the space-tolerant path
+        class of ``MEDIA_TAG_CLEANUP_RE`` swallows both into a single span that
+        begins at offset 0, so "match starts inside a known span" is true for
+        the earlier tag too. A guard keyed on overlapping offsets therefore
+        drops a real attachment: silent loss is worse than the duplicate it
+        fixes.
+
+        The newline-separated form is used because it is well formed: one tag
+        per line, which is how a reply presents two files.
+        """
+        host = self._mount(monkeypatch, tmp_path)
+        log = host / "build.log"
+        png = host / "shot.png"
+        log.write_bytes(b"log")
+        png.write_bytes(b"png")
+
+        media, _ = BasePlatformAdapter.extract_media(
+            "Build log:\nMEDIA:/output/build.log\nScreenshot:\nMEDIA:/output/shot.png\n"
+        )
+        delivered = BasePlatformAdapter.filter_media_delivery_paths(
+            media, session_key="agent:main:matrix:dm:room"
+        )
+        names = sorted(os.path.basename(p) for p, _ in delivered)
+
+        assert names == ["build.log", "shot.png"], (
+            f"expected both files, got {names}"
+        )
